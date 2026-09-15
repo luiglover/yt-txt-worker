@@ -1,105 +1,85 @@
-# ربات تلگرام استخراج متن YouTube روی Cloudflare Workers
+# yt-txt-worker
 
-این پروژه یک Worker کاملاً serverless است: بدون VPS، Docker، Browser، Chrome، Selenium، Puppeteer، Python یا `yt-dlp`.
+Telegram bot on Cloudflare Workers that extracts existing YouTube captions through a native InnerTube multi-client fallback pipeline and sends a cleaned TXT file.
 
-## روش استخراج
+## Extraction flow
 
-Worker صفحه عمومی ویدیو را با `fetch` دریافت می‌کند، داده `ytInitialPlayerResponse` را از HTML می‌خواند و فهرست `captionTracks` را استخراج می‌کند. سپس endpoint زیرنویس خود YouTube با فرمت `json3` فراخوانی می‌شود. ترک‌های دستی همیشه قبل از ترک‌های `kind=asr` (زیرنویس خودکار) امتحان می‌شوند. اگر JSON در دسترس نباشد، parser ساده XML نیز وجود دارد.
+1. Validate the YouTube URL and extract the 11-character video ID.
+2. Call the InnerTube player endpoint sequentially with at most five profiles: ANDROID, IOS, TVHTML5, MWEB, and WEB.
+3. Continue to the next profile after bot detection, HTTP errors, malformed JSON, missing captions, or non-playable responses.
+4. Stop when `playerCaptionsTracklistRenderer.captionTracks` is available.
+5. Rank manual tracks before `kind=asr`, while preferring the default caption index.
+6. Download only the caption track, trying JSON3, then WebVTT, then XML.
+7. Clean timestamps, markup, entities, duplicates, and rolling overlap.
+8. Generate and upload the TXT file entirely in memory.
 
-این روش هیچ API key پولی و هیچ runtime خارج از Web APIs استاندارد Workers ندارد. چون endpoint زیرنویس YouTube عمومی اما رسمی و پایدارِ قراردادی نیست، تغییرات یا محدودسازی IP از سمت YouTube می‌تواند در آینده نیازمند به‌روزرسانی parser باشد.
+No video/audio is downloaded. The project uses no browser automation, Python, subprocess, yt-dlp, Docker, VPS, or third-party transcript API.
 
-## امکانات
-
-- `POST /webhook` برای Telegram webhook
-- `GET /` برای health check
-- پشتیبانی از `youtube.com/watch?v=...`، `youtu.be/...` و `youtube.com/shorts/...`
-- اولویت manual subtitle و سپس auto-generated caption
-- حذف timestamp، markup، فاصله اضافی، تکرار و overlap کپشن‌های rolling
-- تولید و ارسال TXT در حافظه با `Blob` و `FormData`
-- بدون filesystem و بدون ذخیره دائمی اطلاعات کاربران
-- rate limit پایه و best-effort با Cache API؛ شناسه chat پیش از cache شدن SHA-256 می‌شود
-- deduplication موقت Telegram updateها با Cache API
-- پشتیبانی اختیاری از secret header وب‌هوک
-
-## نصب و تست
+## Install and test
 
 ```bash
 npm install
 npm test
+npm run deploy:check
 ```
 
-## اجرای محلی
+Unit tests are fully mocked and do not contact live YouTube.
 
-فایل `.dev.vars` بسازید؛ این فایل در `.gitignore` است:
+## Secrets and variables
 
-```dotenv
-TELEGRAM_BOT_TOKEN=123456:replace_me
-# اختیاری:
-TELEGRAM_WEBHOOK_SECRET=a-long-random-secret
-```
-
-سپس:
+Required existing secret:
 
 ```bash
-npm run dev
-```
-
-## Deploy
-
-```bash
-npx wrangler login
 npx wrangler secret put TELEGRAM_BOT_TOKEN
-npx wrangler deploy
 ```
 
-تنظیمات پیش‌فرض rate limit در `wrangler.toml` برابر ۳ درخواست در ۶۰ ثانیه برای هر chat است. برای احراز هویت قوی‌تر webhook، secret اختیاری را نیز ثبت کنید:
+Optional InnerTube API key, only if keyless requests are rejected:
+
+```bash
+npx wrangler secret put YOUTUBE_INNERTUBE_API_KEY
+```
+
+Optional existing Telegram webhook verification secret:
 
 ```bash
 npx wrangler secret put TELEGRAM_WEBHOOK_SECRET
 ```
 
-## تنظیم Telegram webhook
+Optional `YOUTUBE_CLIENTS_JSON` can override the client profiles without changing source code. It must be a JSON array with `name`, `clientName`, `clientId`, `clientVersion`, `userAgent`, and optional `extra` fields.
 
-بدون secret اختیاری:
-
-```bash
-curl -sS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setWebhook" \
-  -H "content-type: application/json" \
-  -d '{"url":"https://YOUR-WORKER.workers.dev/webhook","allowed_updates":["message"]}'
-```
-
-با secret اختیاری:
+## Deploy
 
 ```bash
-curl -sS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setWebhook" \
-  -H "content-type: application/json" \
-  -d '{"url":"https://YOUR-WORKER.workers.dev/webhook","secret_token":"YOUR_SECRET","allowed_updates":["message"]}'
+npm install
+npm test
+npm run deploy:check
+npx wrangler deploy
 ```
 
-بررسی:
+The Worker remains named `yt-txt-worker`. Existing routes and Telegram flow are unchanged:
 
-```bash
-curl -sS "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getWebhookInfo"
-curl -sS "https://YOUR-WORKER.workers.dev/"
-```
+- `GET /` — health check
+- `POST /webhook` — Telegram webhook
 
-## متغیرها
+Deploying the same Worker name preserves the existing workers.dev URL and webhook destination.
 
-| نام | لازم | پیش‌فرض | توضیح |
-|---|---:|---:|---|
-| `TELEGRAM_BOT_TOKEN` | بله | — | Secret توکن ربات |
-| `TELEGRAM_WEBHOOK_SECRET` | خیر | — | بررسی هدر امنیتی Telegram |
-| `RATE_LIMIT_MAX` | خیر | `3` | حداکثر درخواست در پنجره |
-| `RATE_LIMIT_WINDOW_SECONDS` | خیر | `60` | طول پنجره rate limit |
+## Live test
 
-## ماتریس تست
+1. Deploy the Worker.
+2. Open Cloudflare Workers & Pages → `yt-txt-worker` → Logs.
+3. Send `/start` to the bot.
+4. Send the problematic URL containing video ID `Qtl8lJwbd4g`.
+5. Confirm the bot sends the progress message and then a TXT file or a classified Persian error.
+6. Inspect structured events in order:
+   - `youtube.transcript.start`
+   - `youtube.innertube.client_attempt`
+   - `youtube.innertube.response`
+   - `youtube.caption_tracks.found`
+   - `youtube.caption_track.selected`
+   - `youtube.transcript.success` or `youtube.transcript.failure`
 
-تست‌های خودکار شامل parse هر سه نوع URL، URL جعلی، اولویت manual، fallback به ASR، نبود subtitle، private/deleted، خطای موقت، متن طولانی و اجرای همزمان است. تست زنده YouTube و Telegram باید بعد از Deploy با ویدیوهای منتخب شما انجام شود؛ fixture عمومی ویدیوها ممکن است حذف یا تغییر کند و برای unit test قابل اتکا نیست.
+No tokens, API keys, cookies, authorization headers, Telegram chat IDs, or other user identifiers are included in YouTube extraction logs.
 
-## نکات عملیاتی
+## Important limitation
 
-- فایل TXT روی دیسک نوشته نمی‌شود؛ فقط `Uint8Array`/`Blob` در حافظه ساخته می‌شود.
-- سقف ایمنی فایل ۴۵ MiB است تا پایین‌تر از محدودیت‌های رایج ارسال Telegram بماند.
-- Cache API اتمیک و global rate limiter نیست؛ برای نسخه اول abuse سبک مناسب است. برای محدودسازی سخت در چند PoP باید Durable Object یا KV اضافه شود.
-- هیچ ورودی کاربر به shell یا subprocess فرستاده نمی‌شود؛ پروژه اصلاً subprocess ندارد.
-- خطای فنی فقط با `console.error` در log ثبت می‌شود و پیام عمومی فارسی برای کاربر ارسال می‌گردد.
+InnerTube is an internal YouTube interface rather than a guaranteed public contract. Client versions are centralized in `YOUTUBE_CLIENTS` and can be overridden with `YOUTUBE_CLIENTS_JSON`. Cloudflare egress can still be blocked by YouTube; if every profile is blocked, the bot returns the dedicated bot-detection message instead of incorrectly reporting the video as private.
